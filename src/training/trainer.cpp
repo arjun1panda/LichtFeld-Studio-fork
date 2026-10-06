@@ -5630,7 +5630,8 @@ namespace lfs::training {
         int iter,
         lfs::core::Camera* cam,
         lfs::core::Tensor gt_image,
-        std::stop_token stop_token) {
+        std::stop_token stop_token,
+        const bool replay_fast_capacity) {
         StepPhase current_phase = StepPhase::Forward;
         bool persistent_commit = false;
         const int prof_start = params_.optimization.profile_start_iter;
@@ -5652,10 +5653,11 @@ namespace lfs::training {
             try {
                 LFS_VRAM_SCOPE("train.step");
                 LOG_VRAM_DIFF("train.step");
-                if (PerfBenchCollector::enabled()) {
+                if (!replay_fast_capacity && PerfBenchCollector::enabled()) {
                     PerfBenchCollector::instance().on_step_begin(iter);
                 }
-                PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::StepBegin, iter);
+                if (!replay_fast_capacity)
+                    PerfBenchCollector::phase_mark(PerfBenchCollector::PhaseBoundary::StepBegin, iter);
                 if (live_vram_profiler_enabled()) {
                     auto& profiler = lfs::diagnostics::VramProfiler::instance();
                     profiler.beginIteration(iter);
@@ -5694,13 +5696,15 @@ namespace lfs::training {
                 current_iteration_ = iter;
 
                 // Check control requests at the beginning
-                handle_control_requests(iter, stop_token);
+                if (!replay_fast_capacity)
+                    handle_control_requests(iter, stop_token);
 
-                if (on_iteration_start_)
+                if (!replay_fast_capacity && on_iteration_start_)
                     on_iteration_start_();
                 // Manager/Python callbacks publish parameter updates via setParams().
                 // Install them before forward or optimizer work observes params_.
-                apply_pending_params_at_safe_point();
+                if (!replay_fast_capacity)
+                    apply_pending_params_at_safe_point();
 
                 // Gate this step's in-place parameter writes behind in-flight model
                 // reads (viewer packs, metric renders) — GPU-side waits, ~free once
@@ -5708,7 +5712,7 @@ namespace lfs::training {
                 waitForModelReaders();
 
                 // Python hook: iteration start (safe, pre-forward)
-                {
+                if (!replay_fast_capacity) {
                     lfs::training::HookContext ctx{
                         .iteration = iter,
                         .loss = current_loss_.load(),
@@ -5803,6 +5807,9 @@ namespace lfs::training {
                 r_output.camera = cam;
                 r_output.target_image = gt_image;
                 int tiles_processed = 0;
+                bool deferred_fast_count = false;
+                bool retry_fast_capacity = false;
+                bool resolved_fast_has_work = true;
                 const bool in_sparsification = get_active_sparsify_steps() > 0 &&
                                                iter > get_sparsity_boundary_iteration();
 
@@ -5838,11 +5845,11 @@ namespace lfs::training {
                     three_dgs_path &&
                     update_gaussians_this_iter;
 
-                bool fastgs_strategy_hooks_at_start = false;
+                bool fastgs_strategy_hooks_at_start = replay_fast_capacity;
                 const bool refining_this_step =
                     strategy_ && strategy_->is_refining(iter);
                 const bool morton_due = morton_reorder_due(iter);
-                if (three_dgs_path && !in_sparsification) {
+                if (three_dgs_path && !in_sparsification && !replay_fast_capacity) {
                     current_phase = StepPhase::RefinementCommit;
                     LFS_VRAM_SCOPE("train.strategy.fastgs_pre_step");
                     LOG_VRAM_DIFF("train.strategy.fastgs_pre_step");
@@ -6184,6 +6191,14 @@ namespace lfs::training {
                                         .message = "Fast raster ops are not available",
                                     });
                                 }
+                                deferred_fast_count =
+                                    training_ops_->fast->set_deferred_count != nullptr &&
+                                    training_ops_->fast->resolve_deferred_count != nullptr &&
+                                    run_fastgs_gaussian_backward &&
+                                    !refining_this_step && !morton_due && !in_sparsification &&
+                                    !in_controller_phase && !bilateral_grid_ && !ppisp_;
+                                if (training_ops_->fast->set_deferred_count != nullptr)
+                                    training_ops_->fast->set_deferred_count(fast_saved_, deferred_fast_count);
                                 const auto raster_result = fast_render(
                                     *training_ops_->fast, fast_saved_, *cam, strategy_->get_model(), bg,
                                     0, 0, 0, 0, params_.optimization.mip_filter, bg_tile, render_normal,
@@ -7311,13 +7326,30 @@ namespace lfs::training {
                                             .sparsity_grad_loss = fused_extra_gradients.sparsity_grad_loss,
                                         },
                                         densification_type);
-                                    if (fastgs_adam_enabled(prepared)) {
+                                    if (deferred_fast_count) {
+                                        auto count_result =
+                                            training_ops_->fast->resolve_deferred_count(fast_saved_, false);
+                                        if (count_result.code == lfs::gpu_ops::RasterResult::Code::Pending)
+                                            count_result = training_ops_->fast->resolve_deferred_count(fast_saved_, true);
+                                        if (count_result.code == lfs::gpu_ops::RasterResult::Code::CapacityOverflow) {
+                                            retry_fast_capacity = true;
+                                            LOG_DEBUG("Replaying iteration {} after FastGS capacity growth: {}",
+                                                      iter, count_result.message);
+                                        } else if (count_result.code != lfs::gpu_ops::RasterResult::Code::Success) {
+                                            lfs::core::pop_gpu_range(); // rasterize_backward
+                                            lfs::core::pop_gpu_range(); // rasterize
+                                            return fast_raster_error(count_result);
+                                        } else {
+                                            resolved_fast_has_work = count_result.has_work;
+                                        }
+                                    }
+                                    if (!retry_fast_capacity && resolved_fast_has_work && fastgs_adam_enabled(prepared)) {
                                         optimizer.commit_fastgs_fused_adam(iter);
                                     }
-                                    if (edge_weight_scoring_active_) {
+                                    if (!retry_fast_capacity && resolved_fast_has_work && edge_weight_scoring_active_) {
                                         strategy_->on_edge_score_accumulated(iter);
                                     }
-                                    if (model_write_lock.owns_lock()) {
+                                    if (!retry_fast_capacity && resolved_fast_has_work && model_write_lock.owns_lock()) {
                                         recordParamsReady();
                                     }
                                 } else {
@@ -7329,6 +7361,17 @@ namespace lfs::training {
                     }
 
                     lfs::core::pop_gpu_range(); // End rasterize
+                }
+
+                if (retry_fast_capacity)
+                    return StepDisposition::Retry;
+                if (!resolved_fast_has_work) {
+                    if (auto degenerate = check_invisible_iteration(iter))
+                        return std::move(*degenerate);
+                    LOG_DEBUG("Skipping iteration {} - no visible primitives", iter);
+                    return iter < get_total_iterations() && !stop_requested_.load() && !stop_token.stop_requested()
+                               ? StepDisposition::Continue
+                               : StepDisposition::Stop;
                 }
 
                 if (tiles_processed == 0) {
@@ -8465,6 +8508,8 @@ namespace lfs::training {
                 const auto training_step_begin =
                     std::chrono::steady_clock::now();
                 auto step_result = train_step(iter, cam, gt_image, stop_token);
+                while (step_result && *step_result == StepDisposition::Retry)
+                    step_result = train_step(iter, cam, gt_image, stop_token, true);
                 const double training_step_ms =
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
